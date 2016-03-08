@@ -35,8 +35,26 @@ public class MainActivity extends AppCompatActivity {
 
     FloatingActionButton fab = (FloatingActionButton) findViewById(R.id.fab);
     fab.setOnClickListener((view) -> {
-        Snackbar.make(view, "Replace with your own action", Snackbar.LENGTH_LONG)
-            .setAction("Action", null).show();
+      Snackbar.make(view, "Replace with your own action", Snackbar.LENGTH_LONG)
+          .setAction("Action", null).show();
     });
+  }
+
+  @Override
+  protected void onPause() {
+    printerManager.unRegisterReceivers();
+    super.onPause();
+  }
+
+  @Override
+  protected void onResume() {
+    super.onResume();
+    printerManager.registerReceivers();
+  }
+
+  @Override
+  protected void onDestroy() {
+    printerManager.unRegisterReceivers();
+    super.onDestroy();
   }
 }

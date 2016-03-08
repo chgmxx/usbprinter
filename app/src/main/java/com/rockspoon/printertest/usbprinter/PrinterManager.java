@@ -1,5 +1,6 @@
 package com.rockspoon.printertest.usbprinter;
 
+import android.app.PendingIntent;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
@@ -15,6 +16,7 @@ import android.util.Log;
 
 import org.androidannotations.annotations.AfterInject;
 import org.androidannotations.annotations.Background;
+import org.androidannotations.annotations.UiThread;
 import org.androidannotations.annotations.EBean;
 import org.androidannotations.annotations.RootContext;
 import org.androidannotations.annotations.SystemService;
@@ -27,9 +29,8 @@ import java.util.List;
  */
 @EBean
 public class PrinterManager {
-
-  private static final String USB_PERMISSION_ACTION = "com.rockspoon.printertest.USB_PERMISSION";
-  private static final int recheckRate = 3000;      //  Recheck Job List Rate
+  private static final String ANDROID_USB_PERMISSION = "com.rockspoon.printertest.ACTION_USB_PERMISSION";
+  private static final int recheckRate = 1000;      //  Recheck Job List Rate
   private static final int bulkModeTimeout = 5000;  //  Timeout for bulk mode
 
   @SystemService
@@ -49,7 +50,33 @@ public class PrinterManager {
 
   @AfterInject
   public void afterInject() {
-    IntentFilter filter = new IntentFilter(USB_PERMISSION_ACTION);
+    registerReceivers();
+
+    try {
+      Log.d("PrinterManager", "Checking for connected USB devices");
+      List<UsbDevice> devices = UsbDeviceFilter.getMatchingHostDevices(ctx, R.xml.devices);
+
+      Log.d("PrinterManager", devices.size() + " connected devices that matches xml.devices");
+      if (devices.size() > 0) {
+        askUsbPermissions(devices.get(0));
+      }
+    } catch (Exception e) {
+      Log.w("PrinterManager", "Failed to parse devices.xml: " + e.getMessage());
+    }
+  }
+
+  public void unRegisterReceivers() {
+    try {
+      ctx.unregisterReceiver(usbBroadcastReceiver);
+    } catch (Exception e) {
+      // No need to handle
+    }
+  }
+
+  public void registerReceivers() {
+    IntentFilter filter = new IntentFilter(UsbManager.ACTION_USB_DEVICE_ATTACHED);
+    filter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
+    filter.addAction(ANDROID_USB_PERMISSION);
     ctx.registerReceiver(usbBroadcastReceiver, filter);
   }
 
@@ -72,32 +99,38 @@ public class PrinterManager {
   @Background
   protected void processPrinterJobs() {
     if (printerReady) {
-      synchronized (currentConnection) {
-        PrinterConnection newConn = getAndOpenPrinterConnection();
-        if (currentConnection != null) {
+      synchronized (printerJobList) {
+        if (printerJobList.size() > 0) {
+          synchronized (currentConnection) {
+            PrinterConnection newConn = getAndOpenPrinterConnection();
+            if (newConn != null) {
 
-          currentConnection.setPrinterConnection(newConn);
-
-          synchronized (printerJobList) {
-            while (printerJobList.size() > 0) {
-              final PrinterJob job = printerJobList.get(0);
-              if (executePrintJob(currentConnection, job)) {
-                Log.d("PrinterManager", "Printing job");
-                printerJobList.remove(0);
-              } else {
-                Log.e("PrinterManager", "Cannot print job.");
-                break;
+              currentConnection.setPrinterConnection(newConn);
+              while (printerJobList.size() > 0) {
+                final PrinterJob job = printerJobList.get(0);
+                if (executePrintJob(currentConnection, job)) {
+                  Log.d("PrinterManager", "Printing job");
+                  printerJobList.remove(0);
+                } else {
+                  Log.e("PrinterManager", "Cannot print job.");
+                  break;
+                }
               }
+
+              currentConnection.closeConnection();
+            } else {
+              Log.e("PrinterManager", "Cannot open usb device connection!");
             }
           }
-
-          currentConnection.closeConnection();
-        } else {
-          Log.e("PrinterManager", "Cannot open usb device connection!");
         }
       }
     }
 
+    checkPrintJobs();
+  }
+
+  @UiThread
+  public void checkPrintJobs() {
     new Handler().postDelayed(() -> processPrinterJobs(), recheckRate);
   }
 
@@ -124,6 +157,7 @@ public class PrinterManager {
           printerConnection.iface = iface;
           printerConnection.endPoint = endPoint;
           printerConnection.connection.claimInterface(iface, true);
+          printerConnection.active = true;
           break;
         }
       }
@@ -132,22 +166,31 @@ public class PrinterManager {
     return printerConnection;
   }
 
+  private void askUsbPermissions(UsbDevice device) {
+    PendingIntent permissionIntent = PendingIntent.getBroadcast(ctx, 0, new Intent(ANDROID_USB_PERMISSION), 0);
+    usbManager.requestPermission(device, permissionIntent);
+  }
+
   private final BroadcastReceiver usbBroadcastReceiver = new BroadcastReceiver() {
     @Override
     public void onReceive(Context context, Intent intent) {
-      if (USB_PERMISSION_ACTION.equals(intent.getAction())) {
-        synchronized (this) {
-          usbDevice = (UsbDevice) intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
-          printerReady = (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false) && usbDevice != null);
-          Log.d("PrinterManager","Printer Ready Status: "+printerReady);
-          processPrinterJobs();
-        }
+      if (UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(intent.getAction())) {
+        UsbDevice dev = (UsbDevice) intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+        Log.d("PrinterManager", "Device Attached: " + dev.getDeviceName() + " " + dev.getProductId() + " " + dev.getVendorId());
+        askUsbPermissions(dev);
       } else if (UsbManager.ACTION_USB_DEVICE_DETACHED.equals(intent.getAction())) {
         if (usbDevice != null) {
           synchronized (currentConnection) {
             Log.d("PrinterManager", "Printer detached!");
             currentConnection.closeConnection();
           }
+        }
+      } else if (ANDROID_USB_PERMISSION.equals(intent.getAction())) {
+        synchronized (this) {
+          usbDevice = (UsbDevice) intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+          printerReady = ( intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false) && usbDevice != null);
+          Log.d("PrinterManager","Printer Ready Status: "+printerReady);
+          checkPrintJobs();
         }
       }
     }
@@ -160,10 +203,12 @@ public class PrinterManager {
     boolean active = false;
 
     public void setPrinterConnection(final PrinterConnection printerConnection) {
-      this.connection = printerConnection.connection;
-      this.endPoint = printerConnection.endPoint;
-      this.iface = printerConnection.iface;
-      this.active = printerConnection.active;
+      if (printerConnection != null) {
+        this.connection = printerConnection.connection;
+        this.endPoint = printerConnection.endPoint;
+        this.iface = printerConnection.iface;
+        this.active = printerConnection.active;
+      }
     }
 
     public void closeConnection() {
